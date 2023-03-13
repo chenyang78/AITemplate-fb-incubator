@@ -21,9 +21,10 @@ from typing import List, Optional
 from aitemplate.compiler.base import IntImm, IntVar, Operator, Tensor
 
 from aitemplate.compiler.tensor_accessor import TensorAccessor
-from aitemplate.compiler.transform import transform_utils
+from aitemplate.compiler.transform import transform_strided_ops_utils, transform_utils
+from aitemplate.compiler.transform.toposort import toposort
 
-from aitemplate.utils import graph_utils, shape_utils
+from aitemplate.utils import alignment, graph_utils, shape_utils
 
 
 def _eliminate_cat(sorted_graph: List[Tensor]) -> List[Tensor]:
@@ -237,7 +238,212 @@ def _try_merge_split_cat(split_op: Operator, cat: Operator) -> bool:
     return True
 
 
-def _try_merge_cat_cat(first_cat: Operator, cat: Operator) -> bool:
+def _check_gemm_bmm_alignment(
+    gemm_op: Operator, offset: int, cat_dim: int, first_cat_output: Tensor
+) -> bool:
+    """
+    return True if the gemm/bmm op meets the alignment requirement
+    """
+    dtype = gemm_op._attrs["inputs"][0].dtype()
+    if not alignment.valid_alignment(offset, dtype):
+        return False
+    input_accessors = gemm_op._attrs.get("input_accessors")
+    assert input_accessors is not None, f"expect {gemm_op=} to have input_accessors"
+    for op_input, input_accessor in zip(gemm_op._attrs["inputs"], input_accessors):
+        if op_input is not first_cat_output:
+            continue
+        # import pdb; pdb.set_trace()
+        # make sure we can generate a valid stride access for the gemm/bmm
+        # if not transform_strided_ops_utils.gemm_stride_checker(input_accessor, cat_dim):
+        #     return False
+    return True
+
+
+def _update_first_cat_dst_ops(
+    first_cat: Operator, cat: Operator, cat_dim_offset: int
+) -> None:
+    """
+    update the relevant input for each dst op from the first_cat's output:
+    * if the dst op is the second cat, we skip it; otherwise
+    * we update the dst op's input to make it point to the second cat's output
+      and update the corresponding input accessor for this input
+    """
+    first_cat_output = first_cat._attrs["outputs"][0]
+    cat_outputs = cat._attrs["outputs"]
+    assert len(cat_outputs) == 1, f"expected a single output for {cat=}"
+
+    to_be_discarded_dst_ops = set()
+    cat_output = cat_outputs[0]
+    first_cat_dst_ops = first_cat_output._attrs["dst_ops"]
+    cat_dim = cat._attrs["concat_dim"]
+    for dst_op in first_cat_dst_ops:
+        updated = False
+        for idx, inp in enumerate(dst_op._attrs["inputs"]):
+            if inp is first_cat_output:
+                old_input_accessor = dst_op._attrs["input_accessors"][idx]
+                tmp_dst_input = Tensor(
+                    shape=old_input_accessor.original_shapes, dtype=inp.dtype()
+                )
+                new_input_accessor = TensorAccessor(tmp_dst_input)
+                # import pdb; pdb.set_trace()
+                if len(old_input_accessor.original_shapes) != cat_output._rank():
+                    new_input_accessor.update_base_shape(cat_output.shape())
+                new_input_accessor.update_base_tensor(
+                    cat_output, cat_dim, cat_dim_offset + old_input_accessor.offset
+                )
+                dst_op._attrs["input_accessors"][idx] = new_input_accessor
+                dst_op._attrs["inputs"][idx] = cat_output
+                updated = True
+        if updated:
+            cat_output._attrs["dst_ops"].add(dst_op)
+            to_be_discarded_dst_ops.add(dst_op)
+    first_cat_output._attrs["dst_ops"] = first_cat_dst_ops - to_be_discarded_dst_ops
+
+
+def _check_first_cat_dst_op_input_accessor(
+    dst_op_input: Tensor, input_accessor: TensorAccessor, cat_dim: int
+) -> bool:
+    assert (
+        input_accessor.stride_dim is not None
+    ), f"expected a strided {input_accessor=}"
+    # make sure input_accessor and the first cat have the same stride dim
+    if input_accessor.stride_dim != cat_dim:
+        return False
+    dst_input_rank = dst_op_input._rank()
+    assert (
+        cat_dim < dst_input_rank
+    ), f"expected {cat_dim=} is less than the rank of {dst_op_input=}"
+    original_shape_ndims = len(input_accessor.original_shapes)
+    if dst_input_rank == original_shape_ndims:
+        return True
+    # make it very conservative at the moment: we only allow n-D to (n-1)-D
+    # conversions
+    if abs(dst_input_rank - original_shape_ndims) > 1:
+        return False
+    input_shape = dst_op_input.shape()
+    for i in range(cat_dim):
+        input_dim = input_shape[i]
+        original_dim = input_accessor.original_shapes[i]
+        if input_dim != original_dim:
+            return False
+    input_stride = shape_utils.get_static_stride(input_shape, cat_dim)
+    original_shape_stride = shape_utils.get_static_stride(
+        input_accessor.original_shapes, cat_dim
+    )
+    if input_stride is None or original_shape_stride is None:
+        return False
+    return input_stride == original_shape_stride
+
+
+def _check_first_cat_dst_ops(
+    first_cat: Operator,
+    cat: Operator,
+) -> bool:
+    """
+    Return True if all the dst ops of the first cat.
+    The validity of each dst op is determined by the following rules:
+    * either it's the "cat" op (i.e. the second cat op); or
+    * it supports input_accessors and we can generate a valid stride
+      access to the input associated with the first_cat's output
+    """
+    cat_dim = cat._attrs["concat_dim"]
+    # the offset of the first_cat's output in the second cat's inputs
+    idx = None
+    # this is the offset of the first_cat's output in the second cat's output
+    # along the cat_dim
+    cat_dim_offset = 0
+    first_cat_output = first_cat._attrs["outputs"][0]
+    for i, cat_input in enumerate(cat._attrs["inputs"]):
+        if cat_input is first_cat_output:
+            if idx is None:
+                idx = i
+                break
+        # We stop increasing offset once we've found the right cat_input.
+        # However, one implication is that we only use the first cat_dim_offset
+        # to verify the alignment requirement for the strided op below.
+        # There would be no safey (i.e. misalignment issue) but it also means
+        # that we may miss well-aligned copies if the first cat is used multiple
+        # times by the second cat.
+        if idx is None:
+            cat_dim_offset += cat_input._size(cat_dim).value()
+    assert idx is not None, f"{first_cat=} is not one of the inputs of {cat=}"
+    first_cat_dst_ops = first_cat_output._attrs["dst_ops"]
+    if len(first_cat_dst_ops) == 1:
+        return True
+    if not transform_strided_ops_utils.cat_split_dim_is_static(cat, cat_dim):
+        return False
+    stride = shape_utils.get_static_stride(first_cat_output.shape(), cat_dim)
+    if stride is None:
+        return False
+
+    # the offset of the first cat's output in the second cat't output
+    offset = cat_dim_offset * stride
+    for dst_op in first_cat_dst_ops:
+        if dst_op is cat:
+            continue
+        input_accessors = dst_op._attrs.get("input_accessors")
+        dst_op_offset = None
+        # a first cat's dst op may carry a strided input accessor that was generated
+        # by preceding cat + cat fusions
+        if input_accessors is not None:
+            for dst_op_input, input_accessor in zip(
+                dst_op._attrs["inputs"], input_accessors
+            ):
+                if dst_op_input is not first_cat_output:
+                    continue
+                if input_accessor.stride_dim is None:
+                    continue
+                if not _check_first_cat_dst_op_input_accessor(
+                    dst_op_input, input_accessor, cat_dim
+                ):
+                    return False
+                if dst_op_offset is None:
+                    dst_op_offset = input_accessor.offset
+                else:
+                    assert (
+                        dst_op_offset == input_accessor.offset
+                    ), f"expected {input_accessors=} to have the same offset"
+        if dst_op_offset is None:
+            dst_op_offset = 0
+        dst_op_offset *= stride
+        dst_op_type = dst_op._attrs["op"]
+        if dst_op_type == "fused_elementwise":
+            # fused_elementwise doesn't have any alignment requirement
+            continue
+        elif dst_op_type == "bmm_crr_add":
+            if not _check_gemm_bmm_alignment(
+                dst_op, offset + dst_op_offset, cat_dim, first_cat_output
+            ):
+                return False
+        else:
+            # TODO: add support for more strided ops
+            return False
+    return True
+
+
+def _check_first_cat(first_cat: Operator, cat: Operator) -> bool:
+    """
+    return True if the first cat is valid for fusion
+    """
+    # skip if the first cat has any fused strided op
+    if any(mask is False for mask in first_cat._attrs["input_masks"]):
+        return False
+    # If first_cat carries strided input_accessors, we skip it
+    if "input_accessors" in first_cat._attrs:
+        if any(
+            input_accessor.stride_dim is not None
+            for input_accessor in first_cat._attrs["input_accessors"]
+        ):
+            return False
+    # we need to make sure all other dst ops except the second cat have input
+    # accessors for which we can generate valid strided information
+    return _check_first_cat_dst_ops(first_cat, cat)
+
+
+def _check_second_cat(cat: Operator) -> bool:
+    """
+    return True if the second cat is valid for fusion
+    """
     # Make sure input_accessors do not carry any strided information.
     # It may happen. For example, an input of the cat can be of a strided
     # tensor generated by slice, which takes another concat's output.
@@ -250,19 +456,28 @@ def _try_merge_cat_cat(first_cat: Operator, cat: Operator) -> bool:
         accessor.stride_dim is None for accessor in cat._attrs["input_accessors"]
     ):
         return False
-    # skip if the first cat has any fused strided op
-    if any(mask is False for mask in first_cat._attrs["input_masks"]):
-        return False
     # skip if the second cat has any fused strided op
     if any(mask is False for mask in cat._attrs["input_masks"]):
         return False
-    # If first_cat carries strided input_accessors, we skip it
-    if "input_accessors" in first_cat._attrs:
-        if any(
-            input_accessor.stride_dim is not None
-            for input_accessor in first_cat._attrs["input_accessors"]
-        ):
-            return False
+    # If any of the second cat's dst_ops has strided input_accessor, we skip it.
+    # When this pass makes effects, we haven't run any stride-related passes,
+    # so we should expect no strided accessors for the second cat.
+    cat_output = cat._attrs["outputs"][0]
+    for dst_op in cat_output._attrs["dst_ops"]:
+        input_accessors = dst_op._attrs.get("input_accessors")
+        if input_accessors is None:
+            continue
+        for inp, input_accessor in zip(dst_op._attrs["inputs"], input_accessors):
+            if inp is cat_output and input_accessor.stride_dim is not None:
+                return False
+    return True
+
+
+def _try_merge_cat_cat(first_cat: Operator, cat: Operator) -> bool:
+    if not _check_second_cat(cat):
+        return False
+    if not _check_first_cat(first_cat, cat):
+        return False
     first_cat_inputs = first_cat._attrs["inputs"]
     first_cat_outputs = first_cat._attrs["outputs"]
     assert (
@@ -323,6 +538,15 @@ def _try_merge_cat_cat(first_cat: Operator, cat: Operator) -> bool:
         if tensor is first_cat_output:
             return False
 
+    # note that we have to compute cat_dim_offset before updating cat's inputs,
+    # because we determine the cat_dim_offset based on its old inputs
+    cat_dim_offset = 0
+    cat_dim = cat._attrs["concat_dim"]
+    for i, cat_input in enumerate(cat._attrs["inputs"]):
+        if cat_input is first_cat_output:
+            break
+        cat_dim_offset += cat_input._size(cat_dim).value()
+
     cat._attrs["inputs"] = new_cat_inputs
     # make sure all of the input_masks values are True. We may need to
     # change this part later when we have TensorAccessors, depending on
@@ -334,8 +558,8 @@ def _try_merge_cat_cat(first_cat: Operator, cat: Operator) -> bool:
     for tensor in first_cat_inputs:
         tensor._attrs["dst_ops"].discard(first_cat)
         tensor._attrs["dst_ops"].add(cat)
-    for tensor in first_cat_outputs:
-        transform_utils.remove_tensor_from_sorted_graph(tensor)
+    _update_first_cat_dst_ops(first_cat, cat, cat_dim_offset)
+    transform_utils.remove_tensor_from_sorted_graph(first_cat_output)
     return True
 
 
@@ -380,7 +604,12 @@ def _merge_split_and_cat(sorted_graph: List[Tensor]) -> List[Tensor]:  # noqa: C
         cat = None
         found_cat_op = True
         for output_t in first_op._attrs["outputs"]:
-            if len(output_t._attrs["dst_ops"]) > 1:
+            # TODO: currently, we only allow concatenate output with multiple dst_ops.
+            # We may need to extend it to split ops.
+            if (
+                len(output_t._attrs["dst_ops"]) > 1
+                and first_op._attrs["op"] != "concatenate"
+            ):
                 found_cat_op = False
                 break
             # If first op is output, it can't be fused.
@@ -388,12 +617,14 @@ def _merge_split_and_cat(sorted_graph: List[Tensor]) -> List[Tensor]:  # noqa: C
                 found_cat_op = False
                 continue
             next_ops = output_t._attrs["dst_ops"]
-            if len(next_ops) != 1:
+            if len(next_ops) == 0:
                 break
-            next_op = list(next_ops)[0]
-            if next_op._attrs["op"] != "concatenate":
+            next_concats = [n for n in next_ops if n._attrs["op"] == "concatenate"]
+            # only support cases where first_cat is consumed by a single concat
+            if len(next_concats) != 1:
                 found_cat_op = False
                 break
+            next_op = next_concats[0]
             if cat is None:
                 cat = next_op
             if next_op is not cat:
@@ -412,18 +643,30 @@ def _merge_split_and_cat(sorted_graph: List[Tensor]) -> List[Tensor]:  # noqa: C
             continue
 
         to_be_merged_ops.append([first_op, cat])
+        # only add first_op to the visited set to cases where
+        # we may have chained concat cases:
+        #     concat_0 = concat(x0...)
+        #     concat_1 = concat(concat_0...)
+        #     concat_2 = concat(concat_1...)
+        # where merging concat_0 and concat_1 is invalid but merging concat_1
+        # and concat_2 is valid. If we include both first_op and cat into
+        # the visited set, we would miss the opportunity of merging concat_1
+        # and concat_2.
         visited.add(first_op)
-        visited.add(cat)
 
+    updated_cat_cat = False
     for ops in to_be_merged_ops:
         first_op_type = ops[0]._attrs["op"]
         if first_op_type == "split":
             _try_merge_split_cat(ops[0], ops[1])
         elif first_op_type == "concatenate":
-            _try_merge_cat_cat(ops[0], ops[1])
+            updated_cat_cat = _try_merge_cat_cat(ops[0], ops[1])
         else:
-            assert False, f"unsupported {first_op_type=} for merging with cat"
+            raise AssertionError(f"unsupported {first_op_type=} for merging with cat")
 
+    # we adjusted input/output dependencies so need to run toposort again
+    if updated_cat_cat:
+        sorted_graph = toposort(sorted_graph)
     return transform_utils.sanitize_sorted_graph(sorted_graph)
 
 

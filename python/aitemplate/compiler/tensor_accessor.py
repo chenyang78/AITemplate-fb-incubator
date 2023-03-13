@@ -225,6 +225,7 @@ class TensorAccessor(object):
         Returns None if this function fails to calculate stride strs.
         """
 
+        # import pdb; pdb.set_trace()
         assert dim < len(self.original_shapes), (
             f"dim {dim} must be smaller than original_shapes' rank, "
             f"{len(self.original_shapes)}"
@@ -270,6 +271,7 @@ class TensorAccessor(object):
                     if (self.stride_dim in actual_group) and (
                         idx != len(original_group) - 1
                     ):
+                        # import pdb; pdb.set_trace()
                         # If self.stride_dim is in the corresponding group,
                         # need to make sure that dim is the last dim
                         # inside the original group.
